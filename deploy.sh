@@ -1,109 +1,141 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "=============================="
-echo "   Exception Manager Installer"
-echo "=============================="
+#############################################################
+# Deploy Exception Manager (HTTP only)
+# - Clones repo
+# - Creates python venv
+# - Installs backend requirements
+# - Inits database
+# - Builds frontend
+# - Adds systemd service
+# - Configures Nginx reverse proxy (HTTP)
+#############################################################
 
-REPO_URL="https://github.com/YOURNAME/YOURREPO.git"
+APP_REPO="https://github.com/lowrester/ExceptionManager.git"
 APP_DIR="/opt/exception-manager"
-DB_USER="app_user"
-DB_PASS="ChangeThisPassword"
+
 DB_NAME="exception_manager"
+DB_USER="app_user"
+DB_PASS="$(openssl rand -base64 20)"
 
-echo "[1/9] Updating system..."
-sudo apt update -y && sudo apt upgrade -y
+BACKEND_PORT=8000
 
-echo "[2/9] Installing dependencies (Python, Git, Nginx)..."
-sudo apt install -y python3 python3-venv python3-pip git nginx curl build-essential
+echo "======================================"
+echo "  Deploying Exception Manager"
+echo "======================================"
 
-echo "[3/9] Installing Node.js 20..."
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs
+# Checks
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run as root."
+  exit 1
+fi
 
-echo "[4/9] Installing PostgreSQL..."
-sudo apt install -y postgresql postgresql-contrib
+echo "[1/7] Creating PostgreSQL database..."
 
-echo "[5/9] Setting up PostgreSQL..."
 sudo -u postgres psql <<EOF
-CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';
-CREATE DATABASE $DB_NAME OWNER $DB_USER;
+DO
+\$do\$
+BEGIN
+   IF NOT EXISTS (
+      SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}'
+   ) THEN
+      CREATE ROLE ${DB_USER} LOGIN PASSWORD '${DB_PASS}';
+   END IF;
+END
+\$do\$;
+
+CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};
+GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
 EOF
 
-echo "[6/9] Cloning repository..."
-sudo rm -rf $APP_DIR || true
-sudo git clone $REPO_URL $APP_DIR
+echo "[2/7] Cloning app into $APP_DIR..."
+rm -rf "$APP_DIR" || true
+git clone "$APP_REPO" "$APP_DIR"
 
-echo "[7/9] Setting up Python backend..."
-cd $APP_DIR
+echo "[3/7] Installing Python backend..."
+cd "$APP_DIR"
 python3 -m venv venv
 source venv/bin/activate
-pip install --upgrade pip
+pip install --upgrade pip wheel
+pip install gunicorn
 pip install -r requirements.txt
 
-echo "[*] Creating .env file..."
-SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-SESSION=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+echo "[4/7] Creating .env..."
+SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+SESSION_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 
-cat <<EOF | sudo tee $APP_DIR/.env
+cat > "$APP_DIR/.env" <<EOF
 DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}
-SECRET_KEY=$SECRET
-SESSION_SECRET=$SESSION
+SECRET_KEY=${SECRET_KEY}
+SESSION_SECRET=${SESSION_SECRET}
 ALLOWED_ORIGINS=http://localhost
 UPLOAD_DIR=./uploads
 ENVIRONMENT=production
 DEBUG=False
 EOF
 
-echo "[8/9] Building frontend..."
-cd $APP_DIR/client
+echo "[5/7] Initializing DB (no drop)..."
+
+python3 - <<'EOF'
+from app.init_db import initialize_database
+initialize_database(drop_existing=False)
+EOF
+
+echo "[5/7] Building frontend..."
+cd "$APP_DIR/client"
 npm install
 npm run build
 
-echo "[*] Configuring NGINX..."
-sudo tee /etc/nginx/sites-available/exception_manager >/dev/null <<EOF
+echo "[6/7] Creating systemd service..."
+
+cat > /etc/systemd/system/exception-manager.service <<EOF
+[Unit]
+Description=Exception Manager Backend
+After=network.target postgresql.service
+
+[Service]
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/.env
+ExecStart=${APP_DIR}/venv/bin/gunicorn -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${BACKEND_PORT} app.main:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable exception-manager
+systemctl start exception-manager
+
+echo "[7/7] Configuring Nginx reverse proxy..."
+
+cat > /etc/nginx/sites-available/exception-manager <<EOF
 server {
     listen 80;
 
-    root $APP_DIR/client/dist;
+    root ${APP_DIR}/client/dist;
     index index.html;
 
     location / {
         try_files \$uri /index.html;
     }
 
-    location /api/ {
-        proxy_pass http://127.0.0.1:8000/;
+    location /api {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT};
     }
+
+    client_max_body_size 10M;
 }
 EOF
 
-sudo ln -sf /etc/nginx/sites-available/exception_manager /etc/nginx/sites-enabled/
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo systemctl restart nginx
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/exception-manager /etc/nginx/sites-enabled/
+nginx -t && systemctl restart nginx
 
-echo "[*] Creating systemd service..."
-sudo tee /etc/systemd/system/exception_manager.service >/dev/null <<EOF
-[Unit]
-Description=Exception Manager Backend
-After=network.target postgresql.service
-
-[Service]
-WorkingDirectory=$APP_DIR
-ExecStart=$APP_DIR/venv/bin/gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:8000
-Restart=always
-EnvironmentFile=$APP_DIR/.env
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable exception_manager
-sudo systemctl start exception_manager
-
-echo "=============================="
-echo "   Deployment COMPLETE!"
-echo "=============================="
-echo "Frontend: http://<server-ip>"
-echo "Backend:  http://<server-ip>/api"
+echo
+echo "======================================"
+echo " Exception Manager installed!"
+echo " Frontend:  http://<server-ip>/"
+echo " API Docs:  http://<server-ip>/api/docs"
+echo "======================================"
